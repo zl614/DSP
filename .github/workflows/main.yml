@@ -9,6 +9,12 @@ jobs:
   build:
     runs-on: windows-latest
 
+    env:
+      # Windows CI pipes stdout as cp1252; force UTF-8 so any non-ASCII
+      # output during the build cannot kill the job with UnicodeEncodeError.
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: "1"
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4

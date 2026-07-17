@@ -111,7 +111,18 @@
   .acct-txt{font-family:var(--mono);font-size:12.5px;}
   .acct-txt b{color:var(--ink);}
   .devicecode{border:1px dashed var(--primary);border-radius:9px;padding:12px;background:var(--surface);margin-bottom:12px;}
-  .devicecode .code{font-family:var(--mono);font-size:23px;font-weight:800;letter-spacing:.14em;color:var(--primary);margin:6px 0;}
+  .devicecode .code{font-family:var(--mono);font-size:26px;font-weight:800;letter-spacing:.16em;color:var(--primary);
+    background:#fff;border:1px solid var(--hair);border-radius:8px;padding:8px 14px;user-select:all;}
+  .dc-step{font-size:12.5px;color:var(--muted);font-family:var(--mono);}
+  .dc-row{display:flex;align-items:center;gap:10px;margin:9px 0;flex-wrap:wrap;}
+  .dc-foot{display:flex;justify-content:space-between;gap:10px;font-size:12px;color:var(--muted);margin-top:8px;flex-wrap:wrap;}
+  .dc-timer{font-family:var(--mono);font-weight:700;}
+  .dc-timer.low{color:var(--err);}
+  .dc-warn{font-size:11.5px;color:#7c4a12;background:rgba(180,120,30,.10);border-radius:6px;padding:6px 8px;margin-top:9px;}
+  .dc-warn b{font-weight:800;}
+  .linky{background:none;border:0;color:var(--muted);font:inherit;font-size:11.5px;cursor:pointer;text-decoration:underline;padding:0;}
+  .linky:hover{color:var(--primary);}
+  #dc-again{margin-top:9px;}
   .devicecode a{color:var(--primary);font-family:var(--mono);font-size:12.5px;}
   .sendbtns{display:flex;gap:10px;flex-wrap:wrap;align-items:center;}
   .go{font-weight:800;font-size:14.5px;background:var(--primary);color:var(--onPrimary);border:1px solid var(--primaryDark);border-radius:9px;padding:12px 22px;cursor:pointer;}
@@ -266,15 +277,24 @@
         <div class="acct">
           <span class="dot" id="acct-dot"></span>
           <span class="acct-txt" id="acct-txt">邮箱未登录</span>
-          <button class="mini-btn" id="btn-signin" onclick="mailSignIn()">登录 Outlook 邮箱</button>
+          <button class="mini-btn" id="btn-signin" onclick="mailSignInBrowser()">登录 Outlook 邮箱</button>
           <button class="mini-btn hidden" id="btn-signout" onclick="mailSignOut()">退出</button>
+          <button class="linky hidden" id="btn-devicecode" onclick="mailSignIn()">改用代码登录</button>
         </div>
 
         <div class="devicecode hidden" id="devicecode">
-          <div style="font-size:12.5px;color:var(--muted);font-family:var(--mono);">① 打开下面这个网址，② 输入这串码，③ 用你的公司邮箱登录</div>
-          <div class="code" id="dc-code">—</div>
-          <a id="dc-link" href="https://microsoft.com/devicelogin" target="_blank" rel="noopener">https://microsoft.com/devicelogin ↗</a>
-          <div style="font-size:12px;color:var(--muted);margin-top:7px;" id="dc-wait">等待你在浏览器里完成登录…</div>
+          <div class="dc-step">① 点「复制代码」　② 在微软页面粘贴　③ 用你的公司邮箱登录</div>
+          <div class="dc-row">
+            <div class="code" id="dc-code">—</div>
+            <button class="mini-btn" id="dc-copy" onclick="copyCode()">复制代码</button>
+          </div>
+          <a id="dc-link" href="https://microsoft.com/devicelogin" target="_blank" rel="noopener">打开微软登录页 ↗</a>
+          <div class="dc-foot">
+            <span id="dc-wait">等待你在微软页面完成登录…</span>
+            <span id="dc-timer" class="dc-timer"></span>
+          </div>
+          <div class="dc-warn">这串码是<b>一次性</b>的，<b>15 分钟</b>后作废。过期了点下面重新拿一个。</div>
+          <button class="mini-btn hidden" id="dc-again" onclick="mailSignIn()">重新获取代码</button>
         </div>
 
         <div class="sendbtns">
@@ -320,6 +340,7 @@ function rgbOf(hex){const n=parseInt(hex.slice(1),16);return `${n>>16&255},${n>>
 })();
 
 /* ---------- state ---------- */
+const RELAY = location.protocol==="http:"||location.protocol==="https:";
 const STATE={wb:null,fileBase:"",groups:null,header:null};
 const MAIL={map:{}};
 const LS="spx_fleet_mail_map_v1";
@@ -362,6 +383,7 @@ function pickAgain(e){e.stopPropagation();fileIn.value="";fileIn.click();}
 
 function loadFile(file){
   STATE.fileBase=file.name.replace(/\.(xlsx|xlsm|xls)$/i,"");
+  STATE.rawFile=file;
   const rd=new FileReader();
   rd.onload=ev=>{
     try{ STATE.wb=XLSX.read(new Uint8Array(ev.target.result),{type:"array"}); }
@@ -433,28 +455,79 @@ function recompute(){
   renderMailTable(); renderMail();
 }
 
-/* ---------- xlsx per fleet ---------- */
-function fleetXlsx(r){
+/* ---------- xlsx per fleet（后端带格式）---------- */
+function mapToObj(){
+  const o={}; if(STATE.groups){ STATE.groups.rows.forEach(r=>{ const to=(MAIL.map[r.key]||{}).to; if(to&&to.trim()) o[r.key]=to.trim(); }); }
+  return o;
+}
+// 无格式兜底（仅 file:// 离线时用）：SheetJS 直接生成
+function fleetXlsxPlain(r){
   const ws=XLSX.utils.aoa_to_sheet([STATE.groups.header,...r.rows]);
   const wb=XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb,ws,"Sheet1");
   return XLSX.write(wb,{bookType:"xlsx",type:"array"});
 }
+// 单个车队（带格式）——发邮件用。首封会带上原文件让后端建缓存，其余复用。
+let _sentSrcOnce=false;
+async function fleetXlsx(r, sendSrc){
+  if(!RELAY || !STATE.rawFile){ return fleetXlsxPlain(r); }
+  const fd=new FormData();
+  if(sendSrc){ fd.append("file", STATE.rawFile, STATE.rawFile.name); }
+  fd.append("sheet", document.getElementById("sheet").value);
+  fd.append("colIdx", document.getElementById("col").value);
+  fd.append("headerRow", String(parseInt(document.getElementById("hrow").value,10)||1));
+  fd.append("fleet", r.key);
+  fd.append("fileName", r.file+".xlsx");
+  const res=await fetch("/split-one",{method:"POST",body:fd});
+  if(!res.ok){ throw new Error("后端拆分失败: "+res.status); }
+  return await res.arrayBuffer();
+}
 
 async function downloadZip(){
   if(!STATE.groups)return;
-  const st=document.getElementById("zip-status"); st.textContent="打包中…"; st.className="status";
-  const zip=new JSZip(); const sum=[["File","Fleet","Rows","Email"]];
-  for(const r of STATE.groups.rows){
-    zip.file(r.file+".xlsx", fleetXlsx(r));
-    sum.push([r.file+".xlsx", r.display, r.count, (MAIL.map[r.key]||{}).to||""]);
+  const st=document.getElementById("zip-status");
+
+  // file:// 离线：用 SheetJS 无格式打包（兜底）
+  if(!RELAY || !STATE.rawFile){
+    st.textContent="打包中（无格式，建议用程序打开以保留格式）…"; st.className="status";
+    const zip=new JSZip(); const sum=[["File","Fleet","Rows","Email"]];
+    for(const r of STATE.groups.rows){
+      zip.file(r.file+".xlsx", fleetXlsxPlain(r));
+      sum.push([r.file+".xlsx", r.display, r.count, (MAIL.map[r.key]||{}).to||""]);
+    }
+    const sws=XLSX.utils.aoa_to_sheet(sum),swb=XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(swb,sws,"Summary");
+    zip.file("_SUMMARY.xlsx",XLSX.write(swb,{bookType:"xlsx",type:"array"}));
+    const blob=await zip.generateAsync({type:"blob",compression:"DEFLATE"});
+    triggerBlob(blob, sanitize(STATE.fileBase)+"__by_fleet.zip");
+    st.textContent=`✓ ${STATE.groups.rows.length} 个文件（无格式）`; st.className="status ok";
+    return;
   }
-  const sws=XLSX.utils.aoa_to_sheet(sum),swb=XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(swb,sws,"Summary");
-  zip.file("_SUMMARY.xlsx",XLSX.write(swb,{bookType:"xlsx",type:"array"}));
-  const blob=await zip.generateAsync({type:"blob",compression:"DEFLATE"});
-  const a=document.createElement("a");a.href=URL.createObjectURL(blob);
-  a.download=sanitize(STATE.fileBase)+"__by_fleet.zip";document.body.appendChild(a);a.click();a.remove();
-  st.textContent=`✓ ${STATE.groups.rows.length} 个文件`; st.className="status ok";
+
+  // 正常：后端一次生成带格式的整包
+  st.textContent="正在生成（保留原格式，大文件约十几秒）…"; st.className="status";
+  try{
+    const fd=new FormData();
+    fd.append("file", STATE.rawFile, STATE.rawFile.name);
+    fd.append("sheet", document.getElementById("sheet").value);
+    fd.append("colIdx", document.getElementById("col").value);
+    fd.append("headerRow", String(parseInt(document.getElementById("hrow").value,10)||1));
+    fd.append("base", STATE.fileBase);
+    fd.append("emails", JSON.stringify(mapToObj()));
+    const res=await fetch("/split-all",{method:"POST",body:fd});
+    if(!res.ok){ let m=""; try{ m=(await res.json()).msg; }catch(e){} throw new Error(m||("HTTP "+res.status)); }
+    const blob=await res.blob();
+    triggerBlob(blob, sanitize(STATE.fileBase)+"__by_fleet.zip");
+    _sentSrcOnce=true;   // 缓存已在后端建好，之后发邮件不必再传大文件
+    st.textContent=`✓ ${STATE.groups.rows.length} 个文件（已保留原格式）`; st.className="status ok";
+  }catch(e){
+    st.textContent="生成失败："+e.message; st.className="status err";
+  }
+}
+
+function triggerBlob(blob,name){
+  const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=name;
+  document.body.appendChild(a);a.click();a.remove();
+  setTimeout(()=>URL.revokeObjectURL(a.href),4000);
 }
 
 /* ---------- mail mapping ---------- */
@@ -533,7 +606,6 @@ function clearMapping(){ if(!STATE.groups)return;
   STATE.groups.rows.forEach(r=>delete MAIL.map[r.key]); saveMap();renderMailTable();renderMail(); }
 
 /* ---------- SEND (后台程序 → Microsoft Graph) ---------- */
-const RELAY = location.protocol==="http:"||location.protocol==="https:";
 let MS={configured:false,signedIn:false,user:"",canDraft:true};
 
 async function refreshMailStatus(){
@@ -569,24 +641,112 @@ function updateSendBtns(){
 }
 function setSend(msg,kind){const s=document.getElementById("send-status");s.textContent=msg||"";s.className="status"+(kind?" "+kind:"");}
 
+let POLL=null, TICK=null, WATCH=null;
+
+/* 登录方式 A（默认）：浏览器直接登录 —— 不用抄任何代码 */
+async function mailSignInBrowser(){
+  setSend("");
+  if(WATCH){ clearInterval(WATCH); WATCH=null; }
+  let j;
+  try{ j = await (await fetch("/mail/authurl")).json(); }
+  catch(e){ setSend("连不上后台程序","err"); return; }
+  if(!j.ok){ setSend(j.msg||"登录失败","err"); document.getElementById("btn-devicecode").classList.remove("hidden"); return; }
+
+  const w = window.open(j.url, "_blank");
+  if(!w){ setSend("浏览器拦了弹窗，请允许弹窗后重试","err"); return; }
+  setSend("已打开微软登录页，登录完会自动回来…");
+
+  // 登录成功后后端就有 token 了，这里轮询状态
+  let n = 0;
+  WATCH = setInterval(async()=>{
+    n++;
+    try{
+      const st = await (await fetch("/mail/status")).json();
+      if(st.signedIn){
+        clearInterval(WATCH); WATCH=null;
+        await refreshMailStatus();
+        setSend("邮箱登录成功 ✓","ok");
+        try{ w.close(); }catch(e){}
+        return;
+      }
+    }catch(e){}
+    if(n > 150){                              // 5 分钟还没好就别转了
+      clearInterval(WATCH); WATCH=null;
+      setSend("没等到登录完成。登录页报错的话，可以试试「改用代码登录」","err");
+      document.getElementById("btn-devicecode").classList.remove("hidden");
+    }
+  }, 2000);
+}
+
+function copyCode(){
+  const code=document.getElementById("dc-code").textContent.trim();
+  const btn=document.getElementById("dc-copy");
+  const done=()=>{ btn.textContent="已复制 ✓"; setTimeout(()=>btn.textContent="复制代码",1600); };
+  if(navigator.clipboard && window.isSecureContext){
+    navigator.clipboard.writeText(code).then(done).catch(()=>fallbackCopy(code,done));
+  } else fallbackCopy(code,done);
+}
+function fallbackCopy(text,done){
+  const ta=document.createElement("textarea");
+  ta.value=text; ta.style.position="fixed"; ta.style.opacity="0";
+  document.body.appendChild(ta); ta.select();
+  try{ document.execCommand("copy"); done(); }catch(e){ alert("复制失败，请手动选中代码复制"); }
+  ta.remove();
+}
+
 async function mailSignIn(){
   setSend("");
+  if(POLL){ clearInterval(POLL); POLL=null; }      // 防止点两次导致重复轮询
+  if(TICK){ clearInterval(TICK); TICK=null; }
+  document.getElementById("dc-again").classList.add("hidden");
+
   let j;
   try{ j = await (await fetch("/mail/signin-start",{method:"POST"})).json(); }
   catch(e){ setSend("连不上后台程序","err"); return; }
   if(!j.ok){ setSend(j.msg||"登录失败","err"); return; }
+
   const box=document.getElementById("devicecode");
   document.getElementById("dc-code").textContent=j.userCode;
   document.getElementById("dc-link").href=j.verificationUri;
-  document.getElementById("dc-link").textContent=j.verificationUri+" ↗";
+  document.getElementById("dc-wait").textContent="等待你在微软页面完成登录…";
   box.classList.remove("hidden");
   window.open(j.verificationUri,"_blank","noopener");
-  const iv=setInterval(async()=>{
+
+  // 15 分钟倒计时：让你一眼看到还剩多久，过期了直接给「重新获取」
+  let left = 15*60;
+  const timer=document.getElementById("dc-timer");
+  const paint=()=>{
+    const m=Math.floor(left/60), s=left%60;
+    timer.textContent = left>0 ? `代码 ${m}:${String(s).padStart(2,"0")} 后过期` : "代码已过期";
+    timer.classList.toggle("low", left<=120);
+  };
+  paint();
+  TICK=setInterval(()=>{
+    left--; paint();
+    if(left<=0){
+      clearInterval(TICK); TICK=null;
+      if(POLL){ clearInterval(POLL); POLL=null; }
+      document.getElementById("dc-wait").textContent="这串码已经作废了。";
+      document.getElementById("dc-again").classList.remove("hidden");
+      setSend("代码过期，点「重新获取代码」拿一个新的","err");
+    }
+  },1000);
+
+  POLL=setInterval(async()=>{
     let p;
     try{ p = await (await fetch("/mail/signin-poll",{method:"POST"})).json(); }
     catch(e){ return; }
-    if(p.state==="done"){ clearInterval(iv); box.classList.add("hidden"); await refreshMailStatus(); setSend("邮箱登录成功 ✓","ok"); }
-    else if(p.state==="error"||p.state==="expired"){ clearInterval(iv); box.classList.add("hidden"); setSend(p.msg||"登录失败","err"); }
+    if(p.state==="done"){
+      clearInterval(POLL); POLL=null; if(TICK){clearInterval(TICK);TICK=null;}
+      box.classList.add("hidden");
+      await refreshMailStatus();
+      setSend("邮箱登录成功 ✓","ok");
+    } else if(p.state==="error"||p.state==="expired"){
+      clearInterval(POLL); POLL=null; if(TICK){clearInterval(TICK);TICK=null;}
+      document.getElementById("dc-wait").textContent="登录没成功。";
+      document.getElementById("dc-again").classList.remove("hidden");
+      setSend(p.msg||"登录失败","err");
+    }
   }, Math.max(3,(j.interval||5))*1000);
 }
 async function mailSignOut(){ await fetch("/mail/signout",{method:"POST"}); await refreshMailStatus(); setSend(""); }
@@ -602,6 +762,10 @@ async function sendAll(mode){
   pw.classList.remove("hidden"); pl.innerHTML=""; pb.style.width="0";
 
   const subjT=document.getElementById("tpl-subj").value, bodyT=document.getElementById("tpl-body").value;
+  // 发送前先确保后端缓存已建（用第一个车队带源文件跑一次），避免逐封都传大文件
+  if(RELAY && STATE.rawFile && !_sentSrcOnce){
+    try{ await fleetXlsx(list[0], true); _sentSrcOnce=true; }catch(e){}
+  }
   let ok=0, fail=0;
   for(let i=0;i<list.length;i++){
     const r=list[i], rec=MAIL.map[r.key];
@@ -611,7 +775,7 @@ async function sendAll(mode){
     pl.appendChild(row); pl.scrollTop=pl.scrollHeight;
     setSend(`${mode==="send"?"发送":"建草稿"} ${i+1}/${list.length} …`);
     try{
-      const b64=b64Bytes(fleetXlsx(r));
+      const b64=b64Bytes(await fleetXlsx(r, !_sentSrcOnce)); _sentSrcOnce=true;
       const res=await fetch("/mail/send-one",{method:"POST",headers:{"Content-Type":"application/json"},
         body:JSON.stringify({mode,to:rec.to,cc:rec.cc||"",subject:fill(subjT,v),body:fill(bodyT,v),
                              fileName:r.file+".xlsx",fileB64:b64})});

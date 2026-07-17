@@ -26,17 +26,23 @@ import sys
 import json
 import time
 import re
+import base64
+import hashlib
+import secrets
 import socket
 import threading
 import webbrowser
+from urllib.parse import urlencode
 
-from flask import Flask, request, Response
+from flask import Flask, request, Response, send_file
 import requests
 
 # ===================== 配置 =====================
 CFG = {
-    "port": 5058,          # 被占用会自动往后找（5058 → 5059 → …）
+    # 端口必须固定：Azure 里登记的重定向 URI 是写死端口的，浮动端口会导致登录失败。
+    "port": 5058,
 }
+REDIRECT_URI = f"http://localhost:{CFG['port']}/mail/callback"   # ← Azure 里要登记这一条
 
 # ===================== Outlook 邮件（Microsoft Graph）=====================
 # OAuth 和发信全部用 requests 手写，不引入新依赖。
@@ -55,7 +61,8 @@ GRAPH_LOGIN = "https://login.microsoftonline.com"
 GRAPH_API = "https://graph.microsoft.com/v1.0"
 
 GRAPH_TOKEN = {"access": None, "refresh": None, "exp": 0.0, "user": ""}
-GRAPH_FLOW = {"device_code": None, "interval": 5, "expires": 0.0}
+GRAPH_FLOW = {"device_code": None, "interval": 5, "expires": 0.0}   # 设备码（备用登录方式）
+OAUTH = {"verifier": None, "state": None}                            # 授权码 + PKCE（主登录方式）
 
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
@@ -174,6 +181,166 @@ def cors(resp):
     return resp
 
 
+import io, copy, hashlib, zipfile, threading
+from collections import OrderedDict
+
+# 解析一次原始 xlsx 很慢（大文件带样式约 10-15s），所以按内容哈希缓存，
+# 同一份文件后续拆分（下载 ZIP、逐封发邮件）直接复用，不重复解析。
+_WB_CACHE = {"key": None, "sws": None, "header_cells": None, "col_widths": None,
+             "row_heights": None, "max_col": None, "groups": None, "sheet": None}
+_WB_LOCK = threading.Lock()
+
+
+def _sanitize(name):
+    out = "".join(c if c not in '\\/:*?"<>|' else "_" for c in str(name)).strip()
+    out = out.rstrip(". ")
+    return (out or "unnamed")[:120]
+
+
+def _load_source(src_bytes, sheet_name, col_idx, header_row):
+    """解析原始工作簿 → 缓存表头样式、列宽、按车队分好的行号。返回缓存 key。"""
+    from openpyxl import load_workbook
+    from openpyxl.utils import get_column_letter
+
+    key = hashlib.sha1(src_bytes).hexdigest() + f"|{sheet_name}|{col_idx}|{header_row}"
+    with _WB_LOCK:
+        if _WB_CACHE["key"] == key:
+            return key
+        wb = load_workbook(io.BytesIO(src_bytes))
+        if sheet_name not in wb.sheetnames:
+            sheet_name = wb.sheetnames[0]
+        sws = wb[sheet_name]
+        max_col = sws.max_column
+        col = col_idx + 1
+        header_cells = [[sws.cell(r, i) for i in range(1, max_col + 1)]
+                        for r in range(1, header_row + 1)]
+        col_widths = {}
+        row_heights = {}
+        # 复制所有有记录的列宽（含 H 之后的空列，比如 I），不只到 max_col
+        for L, dim in sws.column_dimensions.items():
+            if dim.width:
+                col_widths[L] = dim.width
+        for r in range(1, header_row + 1):
+            if r in sws.row_dimensions and sws.row_dimensions[r].height:
+                row_heights[r] = sws.row_dimensions[r].height
+        groups = OrderedDict()
+        for r in range(header_row + 1, sws.max_row + 1):
+            v = sws.cell(r, col).value
+            k = "" if v is None else str(v).strip()
+            if k == "":
+                continue
+            groups.setdefault(k, []).append(r)
+        _WB_CACHE.update(key=key, sws=sws, header_cells=header_cells, col_widths=col_widths,
+                         row_heights=row_heights, max_col=max_col, groups=groups, sheet=sheet_name)
+        return key
+
+
+def _copy_cell(sc, dc):
+    dc.value = sc.value
+    if sc.has_style:
+        dc.font = copy.copy(sc.font)
+        dc.fill = copy.copy(sc.fill)
+        dc.border = copy.copy(sc.border)
+        dc.alignment = copy.copy(sc.alignment)
+        dc.number_format = sc.number_format
+        dc.protection = copy.copy(sc.protection)
+
+
+def _build_fleet(fleet_value):
+    """从缓存里生成某个车队的 xlsx（保留原格式）。返回 bytes。"""
+    from openpyxl import Workbook
+    C = _WB_CACHE
+    sws, max_col = C["sws"], C["max_col"]
+    rownums = C["groups"].get(fleet_value, [])
+    dwb = Workbook()
+    dws = dwb.active
+    dws.title = (C["sheet"] or "Sheet1")[:31]
+    for L, w in C["col_widths"].items():
+        dws.column_dimensions[L].width = w
+    dr = 1
+    for hr_i, hc in enumerate(C["header_cells"], start=1):
+        for i, sc in enumerate(hc, start=1):
+            _copy_cell(sc, dws.cell(dr, i))
+        if hr_i in C["row_heights"]:
+            dws.row_dimensions[dr].height = C["row_heights"][hr_i]
+        dr += 1
+    for rn in rownums:
+        for i in range(1, max_col + 1):
+            _copy_cell(sws.cell(rn, i), dws.cell(dr, i))
+        dr += 1
+    b = io.BytesIO()
+    dwb.save(b)
+    return b.getvalue()
+
+
+@app.route("/split-all", methods=["POST"])
+def split_all():
+    """收原始 xlsx，一次性返回「每个车队一个文件（带原格式）+ 汇总」的 ZIP。"""
+    f = request.files.get("file")
+    if not f:
+        return {"ok": False, "msg": "没收到文件"}, 400
+    try:
+        sheet = request.form["sheet"]
+        col_idx = int(request.form["colIdx"])
+        header_row = int(request.form.get("headerRow", "1"))
+        base = request.form.get("base", "split")
+        mapping = json.loads(request.form.get("emails", "{}"))   # {fleet: email} 仅用于汇总表
+        src = f.read()
+        _load_source(src, sheet, col_idx, header_row)
+    except Exception as e:
+        return {"ok": False, "msg": f"{type(e).__name__}: {e}"}, 500
+
+    C = _WB_CACHE
+    used = {}
+    zbuf = io.BytesIO()
+    summary = [["File", "Fleet", "Rows", "Email"]]
+    with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as z:
+        for fleet, rns in C["groups"].items():
+            fn = _sanitize(fleet)
+            low = fn.lower()
+            if low in used:
+                used[low] += 1
+                fn = f"{fn}_{used[low]}"
+            else:
+                used[low] = 1
+            z.writestr(fn + ".xlsx", _build_fleet(fleet))
+            summary.append([fn + ".xlsx", fleet, len(rns), mapping.get(fleet, "")])
+        # 汇总表（用 openpyxl 简单写，无需格式）
+        from openpyxl import Workbook
+        swb = Workbook()
+        sws2 = swb.active
+        sws2.title = "Summary"
+        for row in summary:
+            sws2.append(row)
+        sb = io.BytesIO()
+        swb.save(sb)
+        z.writestr("_SUMMARY.xlsx", sb.getvalue())
+    zbuf.seek(0)
+    return send_file(zbuf, mimetype="application/zip", as_attachment=True,
+                     download_name=f"{_sanitize(base)}__by_fleet.zip")
+
+
+@app.route("/split-one", methods=["POST"])
+def split_one():
+    """返回单个车队的 xlsx（带原格式）——发邮件时一封一封取，复用缓存所以很快。"""
+    f = request.files.get("file")
+    try:
+        sheet = request.form["sheet"]
+        col_idx = int(request.form["colIdx"])
+        header_row = int(request.form.get("headerRow", "1"))
+        fleet = request.form["fleet"]
+        fname = request.form.get("fileName", "fleet.xlsx")
+        # 有文件就（重新）建缓存；没有就用现有缓存（前端发邮件时不必每封都重传大文件）
+        if f is not None:
+            _load_source(f.read(), sheet, col_idx, header_row)
+        elif _WB_CACHE["key"] is None:
+            return {"ok": False, "msg": "缓存已失效，请重新选文件"}, 400
+        data = _build_fleet(fleet)
+    except Exception as e:
+        return {"ok": False, "msg": f"{type(e).__name__}: {e}"}, 500
+    return send_file(io.BytesIO(data), mimetype=XLSX_MIME, as_attachment=True, download_name=fname)
+
+
 @app.route("/")
 @app.route("/split")            # 老链接也留着
 def index():
@@ -201,6 +368,80 @@ def mail_status():
     }
 
 
+# ---------- 登录方式 A：浏览器直接登录（授权码 + PKCE）—— 不用抄任何代码 ----------
+@app.route("/mail/authurl")
+def mail_authurl():
+    if not GRAPH_CFG["client_id"]:
+        return {"ok": False, "msg": "还没配置 client_id（把 graph_config.json 放到程序同目录）。"}
+    verifier = secrets.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(verifier.encode("ascii")).digest()).decode("ascii").rstrip("=")
+    state = secrets.token_urlsafe(16)
+    OAUTH["verifier"], OAUTH["state"] = verifier, state
+    q = urlencode({
+        "client_id": GRAPH_CFG["client_id"],
+        "response_type": "code",
+        "redirect_uri": REDIRECT_URI,
+        "response_mode": "query",
+        "scope": _graph_scopes(),
+        "state": state,
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+        "prompt": "select_account",
+    })
+    return {"ok": True,
+            "url": f"{_authority()}/oauth2/v2.0/authorize?{q}",
+            "redirect": REDIRECT_URI}
+
+
+def _cb_page(ok, msg):
+    color = "#1f7a4d" if ok else "#b3352f"
+    title = "登录成功" if ok else "登录失败"
+    body = (f"已登录：{msg}<br>这个标签页可以关掉了，回到工具页面继续。" if ok
+            else f"{msg}<br><br>回到工具页面重试。")
+    html = f"""<!DOCTYPE html><html lang="zh"><head><meta charset="UTF-8">
+<title>{title}</title><style>
+body{{font-family:-apple-system,"Segoe UI",system-ui,"PingFang SC","Microsoft YaHei",sans-serif;
+background:#F3F6FA;display:grid;place-items:center;height:100vh;margin:0;}}
+.card{{background:#fff;border:1px solid #E2E7ED;border-radius:14px;padding:34px 40px;max-width:520px;
+text-align:center;box-shadow:0 2px 10px rgba(20,30,50,.06);}}
+h1{{color:{color};margin:0 0 12px;font-size:22px;}}
+p{{color:#4a5561;font-size:14px;line-height:1.7;margin:0;word-break:break-word;}}
+</style></head><body><div class="card"><h1>{title}</h1><p>{body}</p></div>
+<script>if({str(ok).lower()}) setTimeout(()=>window.close(),2500);</script>
+</body></html>"""
+    return Response(html, mimetype="text/html; charset=utf-8")
+
+
+@app.route("/mail/callback")
+def mail_callback():
+    if request.args.get("error"):
+        return _cb_page(False, f"{request.args.get('error')}: "
+                               f"{(request.args.get('error_description') or '')[:400]}")
+    code = request.args.get("code")
+    state = request.args.get("state")
+    if not code or not OAUTH["state"] or state != OAUTH["state"]:
+        return _cb_page(False, "state 校验没过（可能是过期的登录链接）。回到工具页面重新点登录。")
+    try:
+        r = requests.post(f"{_authority()}/oauth2/v2.0/token", data={
+            "client_id": GRAPH_CFG["client_id"],
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": REDIRECT_URI,
+            "code_verifier": OAUTH["verifier"],
+            "scope": _graph_scopes(),
+        }, timeout=30)
+        j = r.json()
+    except Exception as e:
+        return _cb_page(False, f"换 token 失败：{e}")
+    OAUTH["verifier"] = OAUTH["state"] = None
+    if "access_token" not in j:
+        return _cb_page(False, j.get("error_description") or str(j)[:400])
+    _store_token(j)
+    return _cb_page(True, GRAPH_TOKEN["user"] or "")
+
+
+# ---------- 登录方式 B：设备码（备用；Azure 没登记重定向 URI 时用）----------
 @app.route("/mail/signin-start", methods=["POST"])
 def mail_signin_start():
     if not GRAPH_CFG["client_id"]:
@@ -311,13 +552,9 @@ def mail_send_one():
 
 
 # ===================== 启动 =====================
-def _free_port(start, tries=10):
-    """端口被占（比如你另一个面板也开着）就自动往后找，别直接崩。"""
-    for p in range(start, start + tries):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            if s.connect_ex(("127.0.0.1", p)) != 0:
-                return p
-    return start
+def _port_busy(port):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        return s.connect_ex(("127.0.0.1", port)) == 0
 
 
 def _open_browser(port):
@@ -326,7 +563,14 @@ def _open_browser(port):
 
 if __name__ == "__main__":
     ok_graph = load_graph_cfg()
-    port = _free_port(CFG["port"])
+    port = CFG["port"]
+
+    if _port_busy(port):
+        print(f"端口 {port} 已经被占用了 —— 是不是已经开着一个了？")
+        print("（这个端口不能换：Azure 里登记的登录回调地址是写死这个端口的。）")
+        print("关掉那个再开，或者重启电脑。")
+        input("按回车关闭…")
+        sys.exit(1)
 
     print("=" * 58)
     print("  SpeedX 包裹清单拆分器 + 按车队发邮件")
@@ -336,6 +580,8 @@ if __name__ == "__main__":
     if ok_graph:
         cid = GRAPH_CFG["client_id"]
         print(f"  邮件： Graph 已配置 (client_id …{cid[-6:]})")
+        print(f"  登录回调： {REDIRECT_URI}")
+        print("           ↑ 这一条必须原样登记在 Azure → Authentication 里")
     else:
         print("  邮件： 未配置 client_id → 拆分照常用，但『发送』是灰的。")
         print("         把 graph_config.json 放到本程序同目录即可启用。")
